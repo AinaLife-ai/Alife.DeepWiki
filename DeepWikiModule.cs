@@ -10,8 +10,9 @@ using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
 using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel.ChatCompletion;
 
-namespace Alife.Demo.Plugin.DeepWiki;
+namespace AinaLife.DeepWiki;
 
 public class DeepWikiConfig
 {
@@ -64,7 +65,7 @@ public class DeepWikiConfig
     public bool IsolateContextByUser { get; set; } = false;
 
     [DisplayName("默认仓库预设")]
-    [Description("格式：会话标识;owner/repo，分号分隔，多组用逗号分隔")]
+    [Description("格式：会话标识;owner/repo，多组用逗号分隔。会话标识支持 群号 或 QQ号")]
     public string DefaultRepoPresets { get; set; } = "";
 
     [DisplayName("重置保留预设")]
@@ -87,46 +88,6 @@ public class DeepWikiConfig
     [Description("是否注册search_deepwiki/ask_deepwiki等LLM工具")]
     public bool EnableLlmTool { get; set; } = true;
 
-    [DisplayName("自动转发")]
-    [Description("超长内容是否用合并转发")]
-    public bool EnableAutoForward { get; set; } = true;
-
-    [DisplayName("强制转发")]
-    [Description("所有内容都走合并转发")]
-    public bool ForceForwardAll { get; set; } = true;
-
-    [DisplayName("长度阈值触发")]
-    [Description("启用长度判断触发转发")]
-    public bool UseLengthThreshold { get; set; } = false;
-
-    [DisplayName("转发阈值")]
-    [Description("超过该长度触发合并转发")]
-    public int ForwardThreshold { get; set; } = 400;
-
-    [DisplayName("发送介绍消息")]
-    [Description("转发前是否发送介绍消息")]
-    public bool SendIntroMessage { get; set; } = false;
-
-    [DisplayName("卡片内附元数据")]
-    [Description("转发卡片内附仓库/问题元数据")]
-    public bool PrependMetadataInCard { get; set; } = true;
-
-    [DisplayName("私聊转发回退")]
-    [Description("私聊合并转发失败时尝试send_forward_msg")]
-    public bool EnablePrivateForwardFallback { get; set; } = true;
-
-    [DisplayName("单节点最大字符")]
-    [Description("合并转发单节点最大字符数(400-3500)")]
-    public int ForwardNodeMaxChars { get; set; } = 800;
-
-    [DisplayName("转发API超时(秒)")]
-    [Description("合并转发API超时时间(15-180)")]
-    public double ForwardApiTimeout { get; set; } = 60;
-
-    [DisplayName("转发失败降级")]
-    [Description("合并转发失败后降级为普通消息")]
-    public bool EnableForwardPlainFallback { get; set; } = false;
-
     [DisplayName("富文本模式")]
     [Description("off=原样 sanitize=去Markdown stylize=全角美化")]
     public string QqRichTextMode { get; set; } = "sanitize";
@@ -138,7 +99,7 @@ public class DeepWikiConfig
 
 [Module("DeepWiki",
     "DeepWiki MCP客户端：查询GitHub仓库Wiki文档、向仓库提问、搜索仓库",
-    defaultCategory: "知识检索")]
+    defaultCategory: "AinaLife/知识检索")]
 public class DeepWikiModule(
     XmlFunctionCaller functionCaller,
     ILogger<DeepWikiModule> logger,
@@ -157,7 +118,6 @@ public class DeepWikiModule(
     private readonly List<string> _clearWords = new();
     private readonly List<string> _statusWords = new();
     private readonly List<(string Pattern, string Repo)> _presetRepos = new();
-    private const int PlainMsgMaxChars = 3500;
 
     private string PrimaryCmd => _commandWords.Contains("/dw") ? "/dw" : (_commandWords.FirstOrDefault() ?? "/dw");
 
@@ -194,6 +154,8 @@ public class DeepWikiModule(
     {
         _searchCache[keyword] = (repos, DateTime.Now);
     }
+
+    // ==================== 富文本处理 ====================
 
     private string Sanitize(string text)
     {
@@ -271,13 +233,15 @@ public class DeepWikiModule(
         return text.Trim();
     }
 
+    // ==================== GitHub 多路搜索 ====================
+
     private async Task<List<Dictionary<string, object?>>> SearchRepositoriesAsync(string keyword, CancellationToken ct = default)
     {
         var results = new List<Dictionary<string, object?>>();
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-            var url = $"https://api.github.com/search/repositories?q={Uri.EscapeDataString(keyword)}&per_page={Configuration.MaxSearchResults}";
+            var url = $"https://api.github.com/search/repositories?q={Uri.EscapeDataString(keyword)}&per_page={Configuration.MaxSearchResults * 2}";
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.TryAddWithoutValidation("User-Agent", "Alife-DeepWiki-Plugin");
             if (!string.IsNullOrEmpty(Configuration.GithubToken))
@@ -316,16 +280,19 @@ public class DeepWikiModule(
         var cached = GetCachedSearch(keyword);
         if (cached != null) return cached;
 
-        var tasks = new List<Task<List<Dictionary<string, object?>>>>();
+        List<Task<List<Dictionary<string, object?>>>> tasks;
         if (Configuration.UseMultiPathSearch)
         {
-            tasks.Add(SearchRepositoriesAsync($"{keyword} in:name", ct));
-            tasks.Add(SearchRepositoriesAsync($"{keyword} in:description,topics", ct));
-            tasks.Add(SearchRepositoriesAsync(keyword, ct));
+            tasks = new()
+            {
+                SearchRepositoriesAsync($"{keyword} in:name", ct),
+                SearchRepositoriesAsync($"{keyword} in:description,topics", ct),
+                SearchRepositoriesAsync(keyword, ct),
+            };
         }
         else
         {
-            tasks.Add(SearchRepositoriesAsync(keyword, ct));
+            tasks = new() { SearchRepositoriesAsync(keyword, ct) };
         }
 
         var allResults = await Task.WhenAll(tasks);
@@ -372,7 +339,7 @@ public class DeepWikiModule(
         return sorted;
     }
 
-    private static string FormatRepoCandidates(List<Dictionary<string, object?>> repos, string cmdPrefix = "/dw", string extraHint = "")
+    private static string FormatRepoCandidates(List<Dictionary<string, object?>> repos, string cmdPrefix = "/dw")
     {
         if (repos == null || repos.Count == 0)
             return "未找到相关仓库。可换个关键词再试，或直接发送 owner/repo。";
@@ -401,10 +368,10 @@ public class DeepWikiModule(
         lines.Add($"• {p} <问题>     → 选定后继续追问（需已有上下文）");
         lines.Add($"• {p} ?          → 查看当前上下文仓库");
         lines.Add($"• {p} clear      → 清除上下文，重新查询仓库来提问");
-        if (!string.IsNullOrEmpty(extraHint) && extraHint.Trim() is { Length: > 0 } hint && hint is not "{}" and not "[]")
-            lines.Add(hint);
         return string.Join("\n", lines).TrimEnd();
     }
+
+    // ==================== 上下文管理 ====================
 
     private string GetCtxKey(string sessionId, string? userId = null)
     {
@@ -556,11 +523,8 @@ public class DeepWikiModule(
     private string BuildAnswerWithMetadata(string repo, string question, string answer)
     {
         var content = answer ?? "";
-        if (Configuration.PrependMetadataInCard)
-        {
-            var prefix = $"【DeepWiki 查询】\n仓库：{repo}\n问题：{question}\n\n";
-            content = prefix + content;
-        }
+        var prefix = $"【DeepWiki 查询】\n仓库：{repo}\n问题：{question}\n\n";
+        content = prefix + content;
         if (Configuration.AppendOperationGuide)
         {
             var guide = GetOperationGuide();
@@ -568,83 +532,6 @@ public class DeepWikiModule(
                 content = content.TrimEnd() + "\n\n" + guide.Trim();
         }
         return content;
-    }
-
-    private static List<string> SplitTextChunks(string text, int maxChars)
-    {
-        text ??= "";
-        if (text.Length <= maxChars) return new List<string> { text };
-
-        var chunks = new List<string>();
-        var blocks = Regex.Split(text, @"\n{2,}");
-        var buf = "";
-        foreach (var block in blocks)
-        {
-            var candidate = string.IsNullOrEmpty(buf) ? block : buf + "\n\n" + block;
-            if (candidate.Length <= maxChars)
-            {
-                buf = candidate;
-                continue;
-            }
-            if (!string.IsNullOrEmpty(buf))
-            {
-                chunks.Add(buf);
-                buf = "";
-            }
-            if (block.Length <= maxChars)
-            {
-                buf = block;
-                continue;
-            }
-            var lines = block.Split('\n');
-            var lineBuf = "";
-            foreach (var line in lines)
-            {
-                var piece = string.IsNullOrEmpty(lineBuf) ? line : lineBuf + "\n" + line;
-                if (piece.Length <= maxChars)
-                {
-                    lineBuf = piece;
-                    continue;
-                }
-                if (!string.IsNullOrEmpty(lineBuf))
-                {
-                    chunks.Add(lineBuf);
-                    lineBuf = "";
-                }
-                if (line.Length <= maxChars)
-                {
-                    lineBuf = line;
-                }
-                else
-                {
-                    for (int i = 0; i < line.Length; i += maxChars)
-                        chunks.Add(line.Substring(i, Math.Min(maxChars, line.Length - i)));
-                    lineBuf = "";
-                }
-            }
-            buf = string.IsNullOrEmpty(lineBuf) ? "" : lineBuf;
-        }
-        if (!string.IsNullOrEmpty(buf)) chunks.Add(buf);
-        return chunks.Count > 0 ? chunks : new List<string> { text[..Math.Min(maxChars, text.Length)] };
-    }
-
-    private string PrepareForwardText(string text)
-    {
-        var mode = string.IsNullOrEmpty(Configuration.QqRichTextMode) ? "sanitize" : Configuration.QqRichTextMode;
-        var s = mode switch
-        {
-            "stylize" => StylizeQqText(text ?? ""),
-            "off" => text ?? "",
-            _ => SanitizeQqText(text ?? "")
-        };
-
-        s = Regex.Replace(s, @"<cite\b[^>]*/?>", "", RegexOptions.IgnoreCase);
-        s = Regex.Replace(s, @"</cite>", "", RegexOptions.IgnoreCase);
-        s = Regex.Replace(s, @"View this search on DeepWiki:.*", "", RegexOptions.IgnoreCase);
-        s = Regex.Replace(s, @"Wiki pages you might want to explore:[\s\S]*?(?=\n\n|\Z)", "", RegexOptions.IgnoreCase);
-        s = Regex.Replace(s, @"[\x00-\x08\x0b\x0c\x0e-\x1f]", "");
-        s = Regex.Replace(s, @"\n{3,}", "\n\n").Trim();
-        return s;
     }
 
     private async Task<string> ExecuteDirectQueryAsync(string repo, string question, string ctxKey)
@@ -781,7 +668,25 @@ public class DeepWikiModule(
         return await HandleKeywordSearchAsync(string.IsNullOrEmpty(question) ? first : rawQuery);
     }
 
-    protected override async Task OnStartAsync(CancellationToken ct)
+    // ==================== 会话识别 ====================
+
+    private string? ExtractSessionId(string text)
+    {
+        // 从消息文本中提取会话ID：[群聊消息(群号)] / [私聊消息(QQ)]
+        var m = Regex.Match(text, @"\[(?:群聊消息|私聊消息)\((\d+)");
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
+    private string? ExtractUserId(string text)
+    {
+        // 从消息文本中提取发送者QQ：[QQ号(昵称)] 格式
+        var m = Regex.Match(text, @"\[(\d{5,})(?:\([^\)]*\))?\]");
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
+    // ==================== 生命周期 ====================
+
+    protected override Task OnAwake()
     {
         _commandWords.Clear();
         _commandWords.AddRange(Configuration.CommandWords.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
@@ -807,38 +712,96 @@ public class DeepWikiModule(
         }
 
         _client = new DeepWikiClient(Configuration.McpUrl, Configuration.ProtocolVersion, Configuration.Timeout, Configuration.MaxRetries);
-        logger.LogInformation("DeepWiki plugin initialized: enable_command={EnableCommand}, presets={PresetCount}, reset_keeps_preset_repo={ResetKeeps}, llm_bind_preset_repo={LlmBind}, isolate_by_user={Isolate}, force_forward_all={ForceForward}",
-            Configuration.EnableCommand, _presetRepos.Count, Configuration.ResetKeepsPresetRepo, Configuration.LlmBindPresetRepo, Configuration.IsolateContextByUser, Configuration.ForceForwardAll);
-        await base.OnStartAsync(ct);
+
+        XmlHandler xmlHandler = new(this) {
+            Description = "DeepWiki MCP客户端：搜索GitHub仓库、向仓库提问、读取Wiki文档结构/内容",
+            Explanation = $"""
+                           DeepWiki 是 GitHub 仓库的 AI 文档服务，可查询任意已索引的 owner/repo。
+
+                           ## 使用方式
+                           - 用户提供完整仓库路径（owner/repo）时，直接调用 ask_deepwiki 提问
+                           - 用户只提供关键词时，先调用 search_deepwiki 搜索候选仓库
+                           - 需要了解仓库文档结构时，用 get_deepwiki_structure 获取主题列表
+                           - 读取具体主题内容时，用 read_deepwiki_content（topic 留空返回概览）
+                           - 用户消息以 /dw 开头时，调用 dw_command 处理（支持关键词搜索、序号选择、clear、? 等子命令）
+
+                           ## 命令模式
+                           命令词：{string.Join(" / ", _commandWords)}
+                           支持：<关键词> 搜索仓库 / <owner/repo> 直接查询 / <数字> 选择候选 / clear 清除上下文 / ? 查看当前仓库
+                           """
+        };
+        functionCaller.RegisterHandler(xmlHandler, DocumentMode.Implicit, DestroyCancellationToken);
+
+        // 注入命令提示：AI 看到 /dw 开头的消息时调用 dw_command
+        ChatBot.ChatSend += OnChatSend;
+
+        logger.LogInformation("DeepWiki plugin initialized: enable_command={EnableCommand}, presets={PresetCount}, reset_keeps_preset_repo={ResetKeeps}, llm_bind_preset_repo={LlmBind}, isolate_by_user={Isolate}",
+            Configuration.EnableCommand, _presetRepos.Count, Configuration.ResetKeepsPresetRepo, Configuration.LlmBindPresetRepo, Configuration.IsolateContextByUser);
+        return Task.CompletedTask;
     }
 
-    protected override async Task OnDestroyAsync(CancellationToken ct)
+    protected override Task OnDestroy()
     {
+        ChatBot.ChatSend -= OnChatSend;
         _client?.Dispose();
         _client = null;
         _answerCache.Clear();
         _searchCache.Clear();
-        await base.OnDestroyAsync(ct);
+        return Task.CompletedTask;
     }
 
-    [XmlFunction("dw_query", "DeepWiki查询：/dw <关键词或owner/repo> 搜索仓库或提问")]
-    public async Task<string> DwQuery([XmlParameter("sessionId", "会话ID")] string sessionId, [XmlParameter("userId", "用户ID(可选)")] string? userId, [XmlParameter("query", "查询内容")] string query)
+    string OnChatSend(string message)
+    {
+        try
+        {
+            if (!Configuration.EnableCommand) return message;
+            // 检测 /dw 开头的用户消息，注入提示让 AI 调用 dw_command 处理
+            var trimmed = message.Trim();
+            foreach (var cmd in _commandWords)
+            {
+                if (string.IsNullOrEmpty(cmd)) continue;
+                if (trimmed == cmd || trimmed.StartsWith(cmd + " ") || trimmed.StartsWith(cmd + ":"))
+                {
+                    return $"{message}\n(这是一条 DeepWiki 命令，请调用 dw_command 函数处理，session_id 从消息来源标签提取，query 为命令后的完整内容)";
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "DeepWiki ChatSend filter error");
+        }
+        return message;
+    }
+
+    // ==================== 工具函数 ====================
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("处理 /dw 命令。用户消息以 /dw（或配置的其他命令词）开头时调用。支持：<关键词> 搜索仓库、<owner/repo> 直接查询、<数字> 从候选列表选择、clear 清除上下文、? 查看当前上下文仓库、无参数时显示用法。")]
+    public async Task<string> DwCommand(
+        [Description("会话ID：从消息来源标签提取的群号或QQ号")] string sessionId,
+        [Description("用户ID(可选)：消息发送者QQ号")] string? userId = null,
+        [Description("命令后的完整内容(不含命令词)")] string query = "")
     {
         if (!Configuration.EnableCommand)
             return "命令模式已禁用";
         return await ProcessDwCommandAsync(sessionId, userId, query);
     }
 
-    [XmlFunction("dw_search", "DeepWiki搜索仓库：返回候选列表")]
-    public async Task<string> DwSearch([XmlParameter("keyword", "搜索关键词")] string keyword)
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("搜索 GitHub 仓库，返回 owner/repo 格式的候选列表。当用户询问某个项目但未提供完整仓库路径时，必须使用此工具获取准确的项目标识。支持多路融合搜索，返回多个候选供选择。")]
+    public async Task<string> SearchDeepWiki(
+        [Description("项目关键词，例如 'KiraAI' 或 'react'")] string keyword)
     {
         if (!Configuration.EnableLlmTool)
             return "LLM 工具调用已被禁用，请使用 /dw 命令直接查询。";
-        return await HandleKeywordSearchAsync(keyword);
+        return Sanitize(await HandleKeywordSearchAsync(keyword));
     }
 
-    [XmlFunction("dw_ask", "DeepWiki提问：向指定仓库提问")]
-    public async Task<string> DwAsk([XmlParameter("repo", "仓库标识 owner/repo")] string repo, [XmlParameter("question", "问题")] string question)
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("向 DeepWiki 提问关于 GitHub 仓库的问题。repo 参数必须是 owner/repo 格式（例如 xxynet/KiraAI）。如果你不知道准确的仓库路径，请先调用 search_deepwiki 工具搜索。")]
+    public async Task<string> AskDeepWiki(
+        [Description("GitHub 仓库标识，格式 owner/repo，例如 xxynet/KiraAI")] string repo,
+        [Description("用户的问题，例如“如何安装插件？”")] string question)
     {
         if (!Configuration.EnableLlmTool)
             return "LLM 工具调用已被禁用，请使用 /dw 命令直接查询。";
@@ -846,6 +809,14 @@ public class DeepWikiModule(
             return "DeepWiki 客户端未初始化";
         if (!Regex.IsMatch(repo ?? "", @"^[\w.-]+/[\w.-]+$"))
             return "repo 参数必须是 owner/repo 格式，例如 xxynet/KiraAI";
+
+        // LLM 绑定预设仓库：repo 参数非法时用绑定仓库兜底
+        if (Configuration.LlmBindPresetRepo && _lastRepo.Count > 0)
+        {
+            var last = _lastRepo.Values.LastOrDefault();
+            if (!string.IsNullOrEmpty(last) && !Regex.IsMatch(repo ?? "", @"^[\w.-]+/[\w.-]+$"))
+                repo = last;
+        }
 
         var key = CacheKey(repo, question);
         var cached = GetCachedAnswer(key);
@@ -859,8 +830,10 @@ public class DeepWikiModule(
         return answer;
     }
 
-    [XmlFunction("dw_structure", "DeepWiki获取仓库文档结构")]
-    public async Task<string> DwStructure([XmlParameter("repo", "仓库标识 owner/repo")] string repo)
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("获取指定 GitHub 仓库的 DeepWiki 文档结构（目录/主题列表）。用于了解仓库有哪些文档页面，方便后续针对性查询。repo 必须是 owner/repo 格式。")]
+    public async Task<string> GetDeepWikiStructure(
+        [Description("GitHub 仓库标识，格式 owner/repo，例如 xxynet/KiraAI")] string repo)
     {
         if (!Configuration.EnableLlmTool)
             return "LLM 工具调用已被禁用，请使用 /dw 命令直接查询。";
@@ -869,8 +842,11 @@ public class DeepWikiModule(
         return await _client.ReadWikiStructureAsync(repo);
     }
 
-    [XmlFunction("dw_contents", "DeepWiki读取仓库文档内容")]
-    public async Task<string> DwContents([XmlParameter("repo", "仓库标识 owner/repo")] string repo, [XmlParameter("topic", "主题(可选)")] string? topic = "")
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("读取指定 GitHub 仓库的 DeepWiki 文档内容。可选指定主题（建议先用 get_deepwiki_structure 获取主题列表）。repo 必须是 owner/repo 格式。topic 留空则返回整体概览或首页内容。")]
+    public async Task<string> ReadDeepWikiContent(
+        [Description("GitHub 仓库标识，格式 owner/repo，例如 xxynet/KiraAI")] string repo,
+        [Description("可选主题名称，如 'Installation'、'Architecture' 等，留空返回整体内容")] string? topic = "")
     {
         if (!Configuration.EnableLlmTool)
             return "LLM 工具调用已被禁用，请使用 /dw 命令直接查询。";
@@ -889,6 +865,8 @@ public class DeepWikiModule(
         return answer;
     }
 }
+
+// ==================== DeepWiki MCP 客户端 ====================
 
 public class DeepWikiClient : IDisposable
 {
@@ -984,7 +962,7 @@ public class DeepWikiClient : IDisposable
                                 lastErr = msg;
                                 if (attempt >= _maxRetries) return msg;
                                 await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), ct);
-                                goto retry;
+                                continue;
                             }
                             return msg;
                         }
@@ -1052,7 +1030,6 @@ public class DeepWikiClient : IDisposable
             {
                 return $"DeepWiki request failed: {e.Message}";
             }
-        retry: ;
         }
         return $"DeepWiki request failed: {lastErr}";
     }
