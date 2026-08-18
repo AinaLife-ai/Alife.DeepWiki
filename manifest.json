@@ -1,4 +1,17 @@
 {
+  "display_name": "DeepWiki",
+  "plugin_id": "DeepWiki",
+  "version": "4.2.0",
+  "author": "AinaLife-ai",
+  "icon": "",
+  "tags": [
+    "deepwiki",
+    "wiki",
+    "github",
+    "mcp"
+  ],
+  "description": "DeepWiki MCP客户端：查询GitHub仓库Wiki文档、向仓库提问、搜索仓库",
+  "repo": "https://github.com/AinaLife-ai/Alife.DeepWiki",
   "Version": "4.2.0",
   "Dependencies": {
     "Alife.Function.FunctionCaller": ""
